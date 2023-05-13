@@ -1,0 +1,3 @@
+pyserial
+types-pyserial
+tomli
