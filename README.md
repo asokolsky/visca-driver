@@ -8,7 +8,7 @@ Some python3 code to:
 * offer rudimentary web GUI for the same
 * offer REST API for such control
 
-[More info][./doc/README.md]
+[More info](doc/README.md)
 
 ## How to use it
 
