@@ -23,11 +23,10 @@ PyVisca by Florian Streibelt <pyvisca@f-streibelt.de>
 https://github.com/mutax/PyVisca/blob/master/pyviscalib/visca.py
 
 Adopted for python3/mypy by Alex Sokolsky <asokolsky@gmail.com>
-TODO: better error handling - exit(1) is not good enough
 '''
 
+from logging import Logger
 from serial import Serial, SerialException
-import sys
 from threading import Lock
 from typing import Optional
 
@@ -37,9 +36,10 @@ class ViscaError(IOError):
 
 class Visca():
 
-    def __init__(self, port:str = "/dev/ttyUSB0") -> None:
+    def __init__(self, log:Logger, port:str = "/dev/ttyUSB0") -> None:
         # guards access to self.serialport
         self.lock = Lock()
+        self.log = log
         #
         self.portname = port
         self.serialport: Optional[Serial] = None
@@ -62,12 +62,14 @@ class Visca():
             #self.serialport.flushInput()
 
         except SerialException as e:
-            print(f"SerialException opening port '{self.portname}':", e)
+            self.log.error(f"SerialException opening port '%s': %s",
+                self.portname, str(e))
             #raise e
             raise ViscaError(e.strerror)
 
         except Exception as e:
-            print(f"Exception opening port '{self.portname}':", e)
+            self.log.error(f"Exception opening port '%s': %s",
+                self.portname, str(e))
             #raise e
 
         finally:
@@ -95,18 +97,18 @@ class Visca():
         else:
             recipient_s = str(recipient)
 
-        print("-----")
+        self.log.debug("-----")
         if title:
-            print(f"packet ({title}) [{sender} => {recipient_s}] len={len(packet)}: {packet.hex()}")
+            self.log.debug(f"packet ({title}) [{sender} => {recipient_s}] len={len(packet)}: {packet.hex()}")
         else:
-            print(f"packet [{sender} => {recipient_s}] len={len(packet)}: {packet.hex()}")
+            self.log.debug(f"packet [{sender} => {recipient_s}] len={len(packet)}: {packet.hex()}")
 
         line = f" QQ.........: {qq:02x}"
         if qq == 0x01:
             line += " (Command)"
         if qq == 0x09:
             line += " (Inquiry)"
-        print(line)
+        self.log.debug(line)
 
         if len(packet) > 3:
             rr = packet[2]
@@ -117,52 +119,68 @@ class Visca():
                 line += " (Camera [1])"
             if rr == 0x06:
                 line += " (Pan/Tilter)"
-            print(line)
+            self.log.debug(line)
 
         if len(packet) > 4:
             data = packet[3:-1]
-            print(f" Data.......: {data.hex()}")
+            self.log.debug(f" Data.......: {data.hex()}")
 
         if term != b'\xff':
-            print("ERROR: Packet not terminated correctly")
+            self.log.error("Packet not terminated correctly")
             return
 
         if len(packet) == 3 and ((qq & 0b11110000) >> 4) == 4:
             socketno = (qq & 0b1111)
-            print(" packet: ACK for socket %02x" % socketno)
+            self.log.debug(" packet: ACK for socket %02x", socketno)
 
         if len(packet) == 3 and ((qq & 0b11110000) >> 4) == 5:
+            # 90-5Y-FF Returned by the camera when execution of commands and
+            # inquiries are completed.
             socketno = (qq & 0b1111)
-            print(" packet: COMPLETION for socket %02x" % socketno)
+            self.log.debug(" packet: COMPLETION for socket %02x", socketno)
 
         if len(packet) > 3 and ((qq & 0b11110000) >> 4) == 5:
             socketno = (qq & 0b1111)
             ret = packet[2:-1].hex()
-            print(f" packet: COMPLETION for socket {socketno}, data={ret}")
+            self.log.debug(
+                f" packet: COMPLETION for socket {socketno}, data={ret}")
+
+        if len(packet) == 3 and qq == 0x38:
+            self.log.debug(
+                "Network Change - we should immediately issue a renumbering!")
 
         if len(packet) == 4 and ((qq & 0b11110000) >> 4) == 6:
-            print(" packet: ERROR!")
+            # 90-6Y-..FF Returned by camera instead of a completion message
+            # when command or inquiry failed to be executed.
+
+            self.log.error(" packet: ERROR!")
 
             socketno = (qq & 0b00001111)
             errcode = packet[2]
 
+            # 90-6Y-01-FF Message length error (>14 bytes)
+            if errcode == 0x01:
+                self.log.error("        : message length error")
+
             #these two are special, socket is zero and has no meaning:
             if errcode == 0x02 and socketno == 0:
-                print("        : Syntax Error")
+                self.log.error("        : syntax error")
+
             if errcode == 0x03 and socketno == 0:
-                print("        : Command Buffer Full")
+                self.log.error("        : command buffer full")
 
             if errcode == 0x04:
-                print(f"        : Socket {socketno}: Command canceled")
+                self.log.info(
+                    f"        : Socket {socketno}: command canceled")
 
             if errcode == 0x05:
-                print(f"        : Socket {socketno}: Invalid socket selected")
+                self.log.debug(
+                    f"        : Socket {socketno}: invalid socket selected")
 
             if errcode == 0x41:
-                print(f"        : Socket {socketno}: Command not executable")
+                self.log.debug(
+                    f"        : Socket {socketno}: command not executable")
 
-        if len(packet) == 3 and qq == 0x38:
-            print("Network Change - we should immediately issue a renumbering!")
         return
 
     def recv_packet(self, extra_title: Optional[str] = None) -> bytes:
@@ -178,7 +196,7 @@ class Visca():
                 packet.extend(s)
                 count += 1
             else:
-                print("ERROR: Timeout waiting for reply")
+                self.log.error("Timeout waiting for a reply")
                 break
             if s == b'\xff':
                 break
@@ -195,7 +213,9 @@ class Visca():
         '''
         assert self.serialport is not None
         if not self.serialport.is_open:
-            sys.exit(1)
+            msg = "trying to write to a closed port"
+            self.log.error(msg)
+            raise ViscaError(msg)
 
         # lets see if a completion message or something
         # else waits in the buffer. If yes dump it.
@@ -243,7 +263,8 @@ class Visca():
             reply = self.recv_packet()
 
         except SerialException as e:
-            print(f"SerialException opening port '{self.portname}':", e)
+            self.log.error(f"SerialException writing to the port '%s': %s",
+                self.portname, e)
 
         finally:
             self.lock.release()
@@ -252,7 +273,8 @@ class Visca():
             return None
 
         if reply[-1:] != b'\xff':
-            print(f"received packet not terminated correctly: {reply.hex()}")
+            self.log.error(
+                f"received packet not terminated correctly: {reply.hex()}")
             return None
 
         return reply
@@ -276,52 +298,60 @@ class Visca():
         s = ls & 0b1111
         return bytes([p, q, r, s])
 
-    def cmd_adress_set(self) -> None:
-        """
+    def cmd_address_set(self) -> None:
+        '''
         starts enumerating devices, sends the first address to use on the bus
         reply is the same packet with the next free address to use
-        """
+        '''
 
         #address of first device. should be 1:
         first = 1
         # set address
         reply = self.send_broadcast(bytes([0x30, first]))
         if not reply:
-            print("No reply from the bus.")
-            sys.exit(1)
+            msg = "No reply from the bus."
+            self.log.error(msg)
+            raise ViscaError(msg)
 
         if len(reply) != 4 or reply[-1:] != b'\xff':
-            print("ERROR enumerating devices")
-            sys.exit(1)
+            msg = "ERROR enumerating devices"
+            self.log.error(msg)
+            raise ViscaError(msg)
 
         if reply[0] != 0x88:
-            print("ERROR: expecting broadcast answer to an enumeration request")
-            sys.exit(1)
+            msg = "ERROR: expecting broadcast answer to an enumeration request"
+            self.log.error(msg)
+            raise ViscaError(msg)
 
         address = reply[2]
         d = address - first
-        print(f"debug: found {d} devices on the bus")
+        msg = f"Found {d} devices on the bus"
         if d == 0:
-            sys.exit(1)
+            self.log.error(msg)
+            raise ViscaError(msg)
+        else:
+            self.log.debug(msg)
         return
 
     def cmd_if_clear_all(self) -> None:
         '''
-        interface clear all
+        Interface clear all.  Stop any current operation in progress.
         '''
         reply = self.send_broadcast(b'\x01\x00\x01')
         if reply is None:
-            print("ERROR sending broadcast")
-            sys.exit(1)
+            msg = "ERROR sending broadcast"
+            self.log.error(msg)
+            raise ViscaError(msg)
 
         if not reply[1:] == b'\x01\x00\x01\xff':
-            print("ERROR clearing all interfaces on the bus!")
-            sys.exit(1)
+            msg = "ERROR clearing all interfaces on the bus!"
+            self.log.error(msg)
+            raise ViscaError(msg)
 
-        print("debug: all interfaces clear")
+        self.log.debug("all interfaces clear")
         return
 
-    def cmd_cam(self, device:int, subcmd:bytes) -> Optional[bytes]:
+    def _cmd_cam(self, device:int, subcmd:bytes) -> Optional[bytes]:
         '''
         Send the command.  Returns reply
         '''
@@ -329,70 +359,73 @@ class Visca():
         #FIXME: check returned data here and retransmit?
         return reply
 
-    def cmd_pt(self, device:int, subcmd:bytes) -> Optional[bytes]:
-        reply = self.send_packet(device, b'\x01\x06' + subcmd)
-        #FIXME: check returned data here and retransmit?
-        return reply
-
     #
-    # POWER control
+    # POWER control.
     #
     def cmd_cam_power(self, device:int, onoff:bool) -> Optional[bytes]:
         if onoff:
             pwr = b'\x00\x02'
         else:
             pwr = b'\x00\x03'
-        return self.cmd_cam(device, pwr)
+        return self._cmd_cam(device, pwr)
 
     def cmd_cam_power_on(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_power(device, True)
 
     def cmd_cam_power_off(self, device:int) -> Optional[bytes]:
+        '''
+        This command stores the zoom and focus value and resets the motors.
+        These commands do not power the camera on or off.
+        '''
         return self.cmd_cam_power(device, False)
 
-    def cmd_cam_auto_power_off(self, device:int, time:int = 0) -> Optional[bytes]:
-        """
+    def cmd_cam_auto_power_off(
+            self, device:int, time:int = 0) -> Optional[bytes]:
+        '''
         time = minutes without command until standby
         0: disable
         0xffff: 65535 minutes
-        """
-        return self.cmd_cam(device, b'\x40' + self.i2v(time))
+        '''
+        return self._cmd_cam(device, b'\x40' + self.i2v(time))
 
     #
     # ZOOM control
     #
     def cmd_cam_zoom_stop(self, device:int) -> Optional[bytes]:
-        return self.cmd_cam(device, b'\x07\x00')
+        '''
+        Zoom_Stop 8x 01 04 07 00 ff
+        '''
+        return self._cmd_cam(device, b'\x07\x00')
 
     def cmd_cam_zoom_tele(self, device:int) -> Optional[bytes]:
-        return self.cmd_cam(device, b'\x07\x02')
+        return self._cmd_cam(device, b'\x07\x02')
 
     def cmd_cam_zoom_wide(self, device:int) -> Optional[bytes]:
-        return self.cmd_cam(device, b'\x07\x03')
+        return self._cmd_cam(device, b'\x07\x03')
 
     def cmd_cam_zoom_tele_speed(self, device:int, speed:int) -> Optional[bytes]:
-        """
+        '''
+        Zoom_Tele 8x 01 04 07 2p ff, p = speed parameter, a (low) to b (high)
         zoom in with speed = 0..7
-        """
+        '''
         sbyte = 0x20 + (speed & 0b111)
-        subcmd = bytes([0x07, sbyte])
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, bytes([0x07, sbyte]))
 
     def cmd_cam_zoom_wide_speed(self, device:int, speed:int) -> Optional[bytes]:
-        """
+        '''
+        Zoom_Wide 8x 01 04 07 3p ff, p = speed parameter, a (low) to b (high)
         zoom in with speed = 0..7
-        """
+        '''
         sbyte = 0x30+(speed & 0b111)
-        subcmd = bytes([0x07, sbyte])
-        return self.cmd_cam(device,subcmd)
+        return self._cmd_cam(device, bytes([0x07, sbyte]))
 
     def cmd_cam_zoom_direct(self, device:int, zoom:int) -> Optional[bytes]:
-        """
-        zoom to value
+        '''
+        Zoom_Direct 8x 01 04 47 0p 0q 0r 0s ff pqrs: zoom position
         optical: 0..4000
         digital: 4000..7000 (1x - 4x)
-        """
-        return self.cmd_cam(device, b'\x47' + self.i2v(zoom))
+        '''
+        return self._cmd_cam(device, b'\x47' + self.i2v(zoom))
 
     def cmd_cam_dzoom(self, device:int, state:bool) -> Optional[bytes]:
         '''
@@ -402,33 +435,68 @@ class Visca():
             subcmd = b'\x06\x02'
         else:
             subcmd = b'\x06\x03'
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, subcmd)
 
     def cmd_cam_dzoom_on(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_dzoom(device, True)
 
     def cmd_cam_dzoom_off(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_dzoom(device, False)
+# FIXME:
+# ZoomFocus_Direct 8x 01 04 47 0p 0q 0r 0s 0t 0u 0v 0w ff
+#   pqrs: zoom position
+#   tuvw: focus position
+#
+# FIXME: CAM_FOCUS COMMANDS
+# Focus_Stop 8x 01 04 08 00 ff
+# Focus_Far  8x 01 04 08 2p ff   p = speed parameter, a (low) to b (high)
+# Focus_Near 8x 01 04 08 3p ff   p = speed parameter, a (low) to b (high)
+# Focus_Direct 8x 01 04 48 0p 0q 0r 0s ff pqrs: focus position
+# Focus_Auto 8x 01 04 38 02 ff              Autofocus mode on/off.
+# NOTE: If the mode is on auto, camera may disable autofocus when focus is ok.
+# Autofocus is turned back on when camera is moved using Zoom_Tele/Wide,
+# PT_Up/Down/Left/Right.  also applies for IR_CameraControl movement.
+# Focus_Manual 8x 01 04 38 03 ff
 
-#FIXME: CAM_FOCUS COMMANDS
-#FIXME: CAM_WB
-#FIXME: CAM_?GAIN
-#FIXME: CAM_AE
-#FIXME: CAM_SlowShutter
-#FIXME: CAM_Shutter
-#FIXME: CAM_Iris
-#FIXME: CAM_Gain
-#FIXME: CAM_Bright
-#FIXME: CAM_ExpComp
-#FIXME: CAM_BackLight
-#FIXME: CAM_Aperature
+#
+# FIXME: CAM_WB
+# WB_Auto           8x 01 04 35 00 ff WB: White Balance
+# WB_Table_Manual   8x 01 04 35 06 ff
+# WB_Table_Direct   8x 01 04 75 0p 0q 0r 0s ff
+#                                ^pqrs = wb table.
+# Used if Wbmode=Table manual.
+# If Wbmode is not Table manual, the table index is stored and used next time
+# Table manual mode is entered.
+#
+# FIXME: CAM_?GAIN
+# FIXME: CAM_AE
+# AE_Auto 8x 01 04 39 00 ff AE: Automatic Exposure.
+# AE_Manual 8x 01 04 39 03 ff
+#
+# FIXME: CAM_SlowShutter
+# FIXME: CAM_Shutter
+# FIXME: CAM_Iris
+# Iris_Direct 8x 01 04 4B 0p 0q 0r 0s ff Used if AE mode = Manual.
+# pqrs: Iris position, range 0..50
+#
+# FIXME: CAM_Gain
+# Gain_Direct 8x 01 04 4c 0p 0q 0r 0s ff Used if AE mode = Manual.
+#  pqrs: Gain position, values: 12-21dB
+#
+# FIXME: CAM_Bright
+# FIXME: CAM_ExpComp
+#
+# FIXME: CAM_BackLight
+# Backlight_On 8x 01 04 33 02 ff BacklightCompensation mode
+# Backlight_Off 8x 01 04 33 03 ff
+#
+# FIXME: CAM_Aperature
 
     def cmd_cam_wide(self, device:int, mode:int) -> Optional[bytes]:
         '''
         16:9 / Wide format:
         '''
-        subcmd = bytes([0x60, mode])
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, bytes([0x60, mode]))
 
     def cmd_cam_wide_off(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_wide(device, 0x00)
@@ -439,21 +507,43 @@ class Visca():
     def cmd_cam_wide_full(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_wide(device, 0x02)
 
+    #
     # mirror
-    def cmd_cam_lr_reverse(self, device:int, mode:int) -> Optional[bytes]:
+    #
+    def _cmd_cam_lr_reverse(self, device:int, mode:int) -> Optional[bytes]:
         subcmd = bytes([0x61, mode])
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, subcmd)
 
     def cmd_cam_lr_reverse_on(self, device:int) -> Optional[bytes]:
-        return self.cmd_cam_lr_reverse(device, 0x02)
+        '''
+        Mirror ON 8x 01 04 61 02 ff
+        '''
+        return self._cmd_cam_lr_reverse(device, 0x02)
 
     def cmd_cam_lr_reverse_off(self, device:int) -> Optional[bytes]:
-        return self.cmd_cam_lr_reverse(device, 0x03)
+        '''
+        Mirror OFF 8x 01 04 61 03 ff
+        '''
+        return self._cmd_cam_lr_reverse(device, 0x03)
+
+    #
+    # FIXME:
+    # Flip_On 8x 01 04 66 02 ff
+    # Flip_Off 8x 01 04 66 03 ff
+    # Sony calls this CAM_ImgFlip.
+    # The “xConfiguration Cameras Camera [1..n] Flip: Auto
+    #
+    # FIXME:
+    # Gamma_Auto 8x 01 04 51 02 ff  Gamma mode. Default uses gamma table 4
+    # Gamma_Manual 8x 01 04 51 03 ff
+    # Gamma_Direct 8x 01 04 52 0p 0q 0r 0s ff
+    #                       pqrs: Gamma table to use in manual mode. Range 0-7
+    #
 
     # freeze
     def cmd_cam_freeze(self, device:int, mode:int) -> Optional[bytes]:
         subcmd = bytes([0x62, mode])
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, subcmd)
 
     def cmd_cam_freeze_on(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_freeze(device, 0x02)
@@ -464,7 +554,7 @@ class Visca():
     # Picture Effects
     def cmd_cam_picture_effect(self, device:int, mode:int) -> Optional[bytes]:
         subcmd = bytes([0x63, mode])
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, subcmd)
 
     def cmd_cam_picture_effect_off(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_picture_effect(device, 0x00)
@@ -497,8 +587,7 @@ class Visca():
         '''
         Apply Digital Effect
         '''
-        subcmd = bytes([0x64, mode])
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, bytes([0x64, mode]))
 
     def cmd_cam_digital_effect_off(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_digital_effect(device, 0x00)
@@ -515,9 +604,10 @@ class Visca():
     def cmd_cam_digital_effect_trail(self, device:int) -> Optional[bytes]:
         return self.cmd_cam_digital_effect(device, 0x04)
 
-    def cmd_cam_digital_effect_level(self, device:int, level:int) -> Optional[bytes]:
+    def cmd_cam_digital_effect_level(
+            self, device:int, level:int) -> Optional[bytes]:
         subcmd = bytes([0x65, 0b00111111 & level])
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, subcmd)
 
     def cmd_cam_memory(self, device:int, func:int, num:int) -> Optional[bytes]:
         '''
@@ -526,12 +616,12 @@ class Visca():
         if num > 5:
             num = 5
         if func < 0 or func > 2:
-            print(f"DEBUG: cmd_cam_memory bad func={func}")
+            self.log.warning(f"cmd_cam_memory bad func={func}")
             return None
 
-        print("DEBUG: cam_memory command")
+        self.log.debug("cam_memory command")
         subcmd = bytes([0x3f, func, (0b0111 & num)])
-        return self.cmd_cam(device, subcmd)
+        return self._cmd_cam(device, subcmd)
 
     def cmd_cam_memory_reset(self, device:int, num:int) -> Optional[bytes]:
         #FIXME: Can only be executed when motion has stopped!!!
@@ -547,8 +637,7 @@ class Visca():
         '''
         Datascreen control
         '''
-        subcmd = bytes([0x06, func])
-        return self.cmd_pt(device, subcmd)
+        return self._cmd_pt(device, bytes([0x06, func]))
 
     def cmd_datascreen_on(self, device:int) -> Optional[bytes]:
         return self.cmd_datascreen(device, 0x02)
@@ -561,47 +650,120 @@ class Visca():
 
 #FIXME: IR_Receive
 #FIXME: IR_Receive_Return
+# FIXME
+# IR_Output_On  8x 01 06 08 02 ff
+# IR_Output_Off 8x 01 06 08 03 ff
+# see IR_push message
+#
+# IR_CameraControl_On 8x 01 06 09 02 ff
+# IR_CameraControl_Off 8x 01 06 09 03 ff
+# Lets the up/down/left/right/zoom+/- on the IR remote control the camera
+# directly. Those keycodes are sent to the controller if the IR Output is on.
+#
 
-    def cmd_ptd(self, device:int, ps:int, ts:int, lr:int, ud:int) -> Optional[bytes]:
+    def _cmd_pt(self, device:int, subcmd:bytes) -> Optional[bytes]:
+        '''
+        Pan/Tilt command starting with 01 06
+        '''
+        reply = self.send_packet(device, b'\x01\x06' + subcmd)
+        #FIXME: check returned data here and retransmit?
+        return reply
+
+    def cmd_ptd_home(self, device:int) -> Optional[bytes]:
+        return self._cmd_pt(device, b'\x04')
+
+    def cmd_ptd_reset(self, device:int) -> Optional[bytes]:
+        '''
+        PT_Reset 8x 01 06 05 ff Reset pan/tilt to center position.
+        This also re–synchronizes the motors
+        '''
+        return self._cmd_pt(device, b'\x05')
+
+    def _cmd_ptd(
+            self, device:int, ps:int, ts:int, lr:int, ud:int) -> Optional[bytes]:
         '''
         Pan and Tilt Drive - pan speed, tilt speed, left/right, up/down
         '''
-        subcmd = bytes([0x01, ps, ts, lr, ud])
-        return self.cmd_pt(device, subcmd)
+        return self._cmd_pt(device, bytes([0x01, ps, ts, lr, ud]))
 
     def cmd_ptd_up(self, device:int, ts:int = 0x14) -> Optional[bytes]:
-        return self.cmd_ptd(device, 0, ts, 0x03, 0x01)
+        '''
+        PT_Up 8x 01 06 01 0p 0t 03 01 ff  p-pan speed, t-tilt speed
+        Up -> increment tilt
+        Down -> decrement tilt
+        '''
+        return self._cmd_ptd(device, 0, ts, 0x03, 0x01)
 
     def cmd_ptd_down(self, device:int,ts:int = 0x14) -> Optional[bytes]:
-        return self.cmd_ptd(device, 0, ts, 0x03, 0x02)
+        '''
+        PT_Down 8x 01 06 01 0p 0t 03 02 ff  p-pan speed, t-tilt speed
+        Up -> increment tilt
+        Down -> decrement tilt
+        '''
+        return self._cmd_ptd(device, 0, ts, 0x03, 0x02)
 
     def cmd_ptd_left(self, device:int, ps:int = 0x18) -> Optional[bytes]:
-        return self.cmd_ptd(device, ps, 0, 0x01, 0x03)
+        '''
+        PT_Left 8x 01 06 01 0p 0t 01 03 ff  p-pan speed, t-tilt speed
+        Right -> increment pan
+        Left -> decrement pan
+        '''
+        return self._cmd_ptd(device, ps, 0, 0x01, 0x03)
 
     def cmd_ptd_right(self, device:int, ps:int = 0x18) -> Optional[bytes]:
-        return self.cmd_ptd(device, ps, 0, 0x02, 0x03)
+        '''
+        PT_Right 8x 01 06 01 0p 0t 02 03 ff  p-pan speed, t-tilt speed
+        Right -> increment pan
+        Left -> decrement pan
+        '''
+        return self._cmd_ptd(device, ps, 0, 0x02, 0x03)
 
-    def cmd_ptd_upleft(self, device:int, ts:int = 0x14, ps:int = 0x18) -> Optional[bytes]:
-        return self.cmd_ptd(device,ps,ts,0x01,0x01)
+    def cmd_ptd_upleft(
+            self, device:int, ts:int = 0x14, ps:int = 0x18) -> Optional[bytes]:
+        '''
+        PT_UpLeft 8x 01 06 01 0p 0t 01 01 ff  p-pan speed, t-tilt speed
+        '''
+        return self._cmd_ptd(device, ps, ts, 0x01, 0x01)
 
-    def cmd_ptd_upright(self, device:int, ts:int = 0x14, ps:int = 0x18) -> Optional[bytes]:
-        return self.cmd_ptd(device,ps,ts,0x02,0x01)
+    def cmd_ptd_upright(
+            self, device:int, ts:int = 0x14, ps:int = 0x18) -> Optional[bytes]:
+        '''
+        PT_UpRight 8x 01 06 01 0p 0t 02 01 ff  p-pan speed, t-tilt speed
+        '''
+        return self._cmd_ptd(device,ps,ts,0x02,0x01)
 
-    def cmd_ptd_downleft(self, device:int, ts:int = 0x14, ps:int = 0x18) -> Optional[bytes]:
-        return self.cmd_ptd(device,ps,ts,0x01,0x02)
+    def cmd_ptd_downleft(
+            self, device:int, ts:int = 0x14, ps:int = 0x18) -> Optional[bytes]:
+        '''
+        PT_DownLeft 8x 01 06 01 0p 0t 01 02 ff  p-pan speed, t-tilt speed
+        '''
+        return self._cmd_ptd(device,ps,ts,0x01,0x02)
 
-    def cmd_ptd_downright(self, device:int, ts:int = 0x14, ps:int = 0x18) -> Optional[bytes]:
-        return self.cmd_ptd(device,ps,ts,0x02,0x02)
+    def cmd_ptd_downright(
+            self, device:int, ts:int = 0x14, ps:int = 0x18) -> Optional[bytes]:
+        '''
+        PT_DownRight 8x 01 06 01 0p 0t 02 02 ff  p-pan speed, t-tilt speed
+        '''
+        return self._cmd_ptd(device, ps, ts, 0x02, 0x02)
 
     def cmd_ptd_stop(self, device:int) -> Optional[bytes]:
-        return self.cmd_ptd(device, 0, 0, 0x03, 0x03)
+        '''
+        PT_Stop 8x 01 06 01 03 03 03 03 ff
+        '''
+        return self._cmd_ptd(device, 0x03, 0x03, 0x03, 0x03)
 
     def cmd_ptd_abs(self, device:int, ts:int = 0x14, ps:int = 0x18, pp:int = 0,
                     tp:int = 0) -> Optional[bytes]:
         '''
         Pan and Tilt Drive - tilt speed, pan speed, pan-pos, tilt-pos
+        PT_Direct 8x 01 06 02 0p 0t 0q 0r 0s 0u 0v 0w 0x 0y ff
+            p: max pan speed
+            t: max tilt speed
+            qrsu: pan position
+            vwxy: tilt position
+            Attempts to linearize movement
         '''
-        print(f"DEBUG: ABS POS TO {pp}/{tp}")
+        self.log.debug(f"DEBUG: ABS POS TO {pp}/{tp}")
 
         # pp: range: -1440 - 1440
         if pp < 0:
@@ -614,12 +776,50 @@ class Visca():
         else:
             t = tp
         subcmd = bytes([0x02, ts, ps]) + self.i2v(p) + self.i2v(t)
-        return self.cmd_pt(device, subcmd)
+        return self._cmd_pt(device, subcmd)
 
-    def cmd_ptd_home(self, device:int) -> Optional[bytes]:
-        return self.cmd_pt(device, b'\x04')
+    # FIXME
+    # PTZF_Direct 8x 01 06 20 0p 0q 0r 0s 0t 0u 0v 0w 0x 0y 0z 0g 0h 0i 0j 0k ff
+    # Sets all motors in one operation.
+    # pqrs: pan
+    # tuvw: tilt
+    # xyzg: zoom
+    # hijk: focus
+    # Attempts to linearize movement for pan and tilt.
+    # The focus value will not be used if the camera is in continuous autofocus
+    # mode.
+    # NOTE: Never route this message through Sony cameras.
 
-    def cmd_ptd_reset(self, device:int) -> Optional[bytes]:
-        return self.cmd_pt(device, b'\x05')
+    # FIXME:
+    # PT_Limit_Set * 8x 01 06 07 00 0x 0p 0q 0r 0s 0t 0u 0v 0w ff
+    # x=1: Up/Right
+    # x=0: Down/Left
+    # pqrs: Pan limit
+    # tuvx: Tilt limit.
+    # This command is valid until the next time the camera boots.
 
-#FIXME: Pan-tiltLimitSet
+    # FIXME
+    # PT_Limit_Clear * 8x 01 06 07 01 0x [...] ff x=1: Up/Right
+    # x=0: Down/Left
+    # Sony specifies several filler bytes after 0x. These can be ignored
+
+    #
+    # FIXME:
+    # MM_Detect_On 8x 01 50 30 01 ff
+    # Turn on the Motor Moved Detection.
+    # The camera recalibrates if touched.
+    # MM_Detect_Off 8x 01 50 30 00 ff
+    # Turn off the Motor Moved Detection.
+    # The camera does not recalibrate if touched.
+    #
+    # FIXME
+    # Call_LED_On    8x 01 33 01 01 ff
+    # Call_LED_Off   8x 01 33 01 00 ff
+    # Call_LED_Blink 8x 01 33 01 02 ff
+    # Refers to the LED on top of the camera. It is always off on startup.
+    #
+    # FIXME
+    # Power_LED_On 8x 01 33 02 01 ff
+    # Power_LED_Off 8x 01 33 02 00 ff
+    # Green power LED. If switched to off and stored to startup profile,
+    # it is always off.

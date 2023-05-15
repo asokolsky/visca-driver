@@ -26,37 +26,53 @@ Adopted for python3/mypy by Alex Sokolsky <asokolsky@gmail.com>
 TODO: better error handling - exit(1) is not good enough
 '''
 
-from visca import Visca
+import logging
 from time import sleep
+from typing import List, Tuple
 
-def main() -> None:
-    v = Visca("/dev/ttyUSB1")
-    sleep(3)
-    v.cmd_adress_set()
+from . visca import Visca
+from . logger import create_logger
+
+log = create_logger(
+    None,  # log_file_path,
+    logging.DEBUG)
+
+def visca_initialize(v: Visca) -> None:
+    v.cmd_address_set()
     sleep(3)
     v.cmd_if_clear_all()
+    sleep(3)
+    return
+
+def visca_memory_set(v: Visca, cam: int, postns: List[Tuple[int, int]]) -> None:
+    mem = 0
+    for pp, tp in postns:
+        v.cmd_ptd_abs(cam, pp=pp, tp=tp)
+        sleep(3)
+        v.cmd_cam_memory_set(cam, mem)
+        sleep(3)
+        mem += 1
+
+    return
+
+def main() -> None:
+    v = Visca(log, "/dev/ttyUSB1")
+    visca_initialize(v)
 
     # device # of the webcam
     CAM = 1
 #	v.cmd_cam_power_off(CAM)
     v.cmd_cam_power_on(CAM)
-    v.cmd_cam_auto_power_off(CAM,2)
+    v.cmd_cam_auto_power_off(CAM, 2)
     v.cmd_datascreen_on(CAM)
 
     sleep(3)
-    v.cmd_ptd_abs(CAM,pp=-1440,tp=-360)
-    sleep(3)
-    v.cmd_cam_memory_set(CAM,0)
 
-    sleep(3)
-    v.cmd_ptd_abs(CAM,pp=1440,tp=360)
-    sleep(3)
-    v.cmd_cam_memory_set(CAM,1)
-
-    sleep(3)
-    v.cmd_ptd_abs(CAM,pp=0,tp=0)
-    sleep(3)
-    v.cmd_cam_memory_set(CAM,2)
+    visca_memory_set(v, CAM, [
+        (-1440, -360),
+        (1440, 360),
+        (0, 0),
+    ])
 
     sleep(5)
     v.cmd_cam_memory_recall(CAM,0)

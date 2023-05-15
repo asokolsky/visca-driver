@@ -1,6 +1,6 @@
-# A process talking to VISCA camera.
+# A set of processes talking to VISCA camera.
 
-Based on the code from
+Borrowed some code from
 https://github.com/mutax/PyVisca/blob/master/pyviscalib/visca.py
 
 ## Architecture
