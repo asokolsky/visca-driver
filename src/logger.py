@@ -22,14 +22,14 @@ def create_logger(log_file_path:Optional[str], log_level:int) -> logging.Logger:
     '''
     logging.basicConfig(
         level=log_level,
-        filename=log_file_path,
+        filename=log_file_path, filemode='w',
         format=msg_format, datefmt=date_format)
     log = logging.getLogger()
     return log
 
 
 log = create_logger(
-    None,  # log_file_path,
+    log_file_path,
     log_level)
 
 def get_logger() -> logging.Logger:

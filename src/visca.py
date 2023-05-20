@@ -28,18 +28,53 @@ Adopted for python3/mypy by Alex Sokolsky <asokolsky@gmail.com>
 from logging import Logger
 from serial import Serial, SerialException
 from threading import Lock
-from typing import Optional
+from time import sleep, time
+from typing import Optional, Tuple
 
 class ViscaError(IOError):
     """Base class for Visca errors."""
     pass
 
+class ViscaTimeout(ViscaError):
+    """Timeout for wait_xxx function"""
+    pass
+
 class Visca():
 
-    def __init__(self, log:Logger, port:str = "/dev/ttyUSB0") -> None:
+    @staticmethod
+    def i2v(value:int) -> bytes:
+        '''
+        return value as 4-byte dword in Visca format
+        packets are not allowed to be 0xff
+        so for numbers the first nibble is 0000
+        and 0xfd gets encoded into 0x0f 0x0xd
+        '''
+        ms = (value & 0b1111111100000000) >> 8
+        ls = (value & 0b0000000011111111)
+        p = (ms & 0b11110000) >> 4
+        r = (ls & 0b11110000) >> 4
+        q = ms & 0b1111
+        s = ls & 0b1111
+        return bytes([p, q, r, s])
+
+    @staticmethod
+    def v2i(value:bytes, start:int) -> int:
+        '''
+        0p 0p 0p 0p
+        '''
+        a = value[start+0]
+        b = value[start+1]
+        c = value[start+2]
+        d = value[start+3]
+        return (a*0x1000) + (b*0x100) + (c*0x10) + d
+
+
+    def __init__(self, log:Logger, port:str = "/dev/ttyUSB0",
+                 bVerbose:bool = True) -> None:
         # guards access to self.serialport
         self.lock = Lock()
         self.log = log
+        self.bVerbose = bVerbose
         #
         self.portname = port
         self.serialport: Optional[Serial] = None
@@ -62,13 +97,13 @@ class Visca():
             #self.serialport.flushInput()
 
         except SerialException as e:
-            self.log.error(f"SerialException opening port '%s': %s",
+            self.log.error("SerialException opening port '%s': %s",
                 self.portname, str(e))
             #raise e
             raise ViscaError(e.strerror)
 
         except Exception as e:
-            self.log.error(f"Exception opening port '%s': %s",
+            self.log.error("Exception opening port '%s': %s",
                 self.portname, str(e))
             #raise e
 
@@ -79,7 +114,7 @@ class Visca():
 
     def dump(self, packet:bytes, title:Optional[str] = None) -> None:
         '''
-        Dump the packet
+        Dump the packet into the log
         '''
         if not packet or len(packet) == 0:
             return
@@ -97,11 +132,12 @@ class Visca():
         else:
             recipient_s = str(recipient)
 
-        self.log.debug("-----")
-        if title:
-            self.log.debug(f"packet ({title}) [{sender} => {recipient_s}] len={len(packet)}: {packet.hex()}")
+        if title is not None:
+            line = f"{title} "
         else:
-            self.log.debug(f"packet [{sender} => {recipient_s}] len={len(packet)}: {packet.hex()}")
+            line = "packet "
+        line += f"[{sender} => {recipient_s}] len={len(packet)}: {packet.hex(' ')}"
+        self.log.debug(line)
 
         line = f" QQ.........: {qq:02x}"
         if qq == 0x01:
@@ -118,12 +154,12 @@ class Visca():
             if rr == 0x04:
                 line += " (Camera [1])"
             if rr == 0x06:
-                line += " (Pan/Tilter)"
+                line += " (Pan/Tilt)"
             self.log.debug(line)
 
         if len(packet) > 4:
             data = packet[3:-1]
-            self.log.debug(f" Data.......: {data.hex()}")
+            self.log.debug(f" Data.......: {data.hex(' ')}")
 
         if term != b'\xff':
             self.log.error("Packet not terminated correctly")
@@ -131,19 +167,19 @@ class Visca():
 
         if len(packet) == 3 and ((qq & 0b11110000) >> 4) == 4:
             socketno = (qq & 0b1111)
-            self.log.debug(" packet: ACK for socket %02x", socketno)
+            self.log.debug(" ACK for socket %02x", socketno)
 
         if len(packet) == 3 and ((qq & 0b11110000) >> 4) == 5:
             # 90-5Y-FF Returned by the camera when execution of commands and
             # inquiries are completed.
             socketno = (qq & 0b1111)
-            self.log.debug(" packet: COMPLETION for socket %02x", socketno)
+            self.log.debug(" COMPLETION for socket %02x", socketno)
 
         if len(packet) > 3 and ((qq & 0b11110000) >> 4) == 5:
             socketno = (qq & 0b1111)
-            ret = packet[2:-1].hex()
-            self.log.debug(
-                f" packet: COMPLETION for socket {socketno}, data={ret}")
+            ret = packet[2:-1].hex(' ')
+            self.log.debug(" COMPLETION for socket %02x, data=%s",
+                           socketno, ret)
 
         if len(packet) == 3 and qq == 0x38:
             self.log.debug(
@@ -153,7 +189,7 @@ class Visca():
             # 90-6Y-..FF Returned by camera instead of a completion message
             # when command or inquiry failed to be executed.
 
-            self.log.error(" packet: ERROR!")
+            self.log.error(" ERROR!")
 
             socketno = (qq & 0b00001111)
             errcode = packet[2]
@@ -183,33 +219,64 @@ class Visca():
 
         return
 
-    def recv_packet(self, extra_title: Optional[str] = None) -> bytes:
+    def _recv_packet(self, extra_title: Optional[str] = None) -> bytes:
         '''
-        Receive a packet - up to 16 bytes until 0xff
+        Receive a packet - 3 to 16 bytes until 0xff
+        will block
         '''
         assert self.serialport is not None
         packet = bytearray()
         count = 0
+        # packet can be anywhere between 3 and 16 bytes
         while count < 16:
             s = self.serialport.read(1)
             if s:
                 packet.extend(s)
                 count += 1
             else:
-                self.log.error("Timeout waiting for a reply")
+                self.log.warning("Timeout waiting for a reply")
                 break
             if s == b'\xff':
                 break
 
-        if extra_title:
-            self.dump(packet, f"recv: {extra_title}")
-        else:
-            self.dump(packet, "recv")
+        if self.bVerbose:
+            if extra_title:
+                self.dump(packet, f"Rx: {extra_title}")
+            else:
+                self.dump(packet, "Rx")
         return packet
+
+    def wait_for_completion(self, secs:float) -> Optional[bytes]:
+        '''
+        Wait for the completion message for upto secs.
+        Returns a packet or None in case of timeout
+        '''
+        if self.serialport is None:
+            return None
+        try:
+            self.lock.acquire()
+
+            start = time()
+            done = start + secs
+            while time() < done:
+                if self.serialport.in_waiting:
+                    ms = int((time() - start)*1000)
+                    return self._recv_packet(f"after {ms}ms")
+                sleep(1)
+
+        except SerialException as e:
+            self.log.error("SerialException reading from the port '%s': %s",
+                self.portname, e)
+
+        finally:
+            self.lock.release()
+
+        raise ViscaTimeout(f"Reached wait_for_completion timeout of {secs}")
 
     def _write_packet(self, packet:bytes) -> None:
         '''
         Write packet to self.serialport
+        Will pick the message from the port if the one is available
         '''
         assert self.serialport is not None
         if not self.serialport.is_open:
@@ -220,14 +287,16 @@ class Visca():
         # lets see if a completion message or something
         # else waits in the buffer. If yes dump it.
         if self.serialport.in_waiting:
-            self.recv_packet("ignored")
+            self._recv_packet("ignored")
 
         self.serialport.write(packet)
-        self.dump(packet,"sent")
+        self.dump(packet, "Tx")
         return
 
     def send_packet(self, recipient:int, data:bytes) -> Optional[bytes]:
         """
+        Will add terminator '\xff' to the data
+
         according to the documentation:
 
         |------packet (3-16 bytes)---------|
@@ -260,10 +329,10 @@ class Visca():
         try:
             self.lock.acquire()
             self._write_packet(packet)
-            reply = self.recv_packet()
+            reply = self._recv_packet()
 
         except SerialException as e:
-            self.log.error(f"SerialException writing to the port '%s': %s",
+            self.log.error("SerialException writing to the port '%s': %s",
                 self.portname, e)
 
         finally:
@@ -274,7 +343,7 @@ class Visca():
 
         if reply[-1:] != b'\xff':
             self.log.error(
-                f"received packet not terminated correctly: {reply.hex()}")
+                f"received packet not terminated correctly: {reply.hex(' ')}")
             return None
 
         return reply
@@ -282,21 +351,6 @@ class Visca():
     def send_broadcast(self, data: bytes) -> Optional[bytes]:
         # shortcut
         return self.send_packet(-1, data)
-
-    def i2v(self, value:int) -> bytes:
-        """
-        return value as 4-byte dword in Visca format
-        packets are not allowed to be 0xff
-        so for numbers the first nibble is 0000
-        and 0xfd gets encoded into 0x0f 0x0xd
-        """
-        ms = (value & 0b1111111100000000) >> 8
-        ls = (value & 0b0000000011111111)
-        p = (ms & 0b11110000) >> 4
-        r = (ls & 0b11110000) >> 4
-        q = ms & 0b1111
-        s = ls & 0b1111
-        return bytes([p, q, r, s])
 
     def cmd_address_set(self) -> None:
         '''
@@ -335,7 +389,8 @@ class Visca():
 
     def cmd_if_clear_all(self) -> None:
         '''
-        Interface clear all.  Stop any current operation in progress.
+        Clears the command buffer in the unit. When cleared, the operation
+        currently being executed is not guaranteed.
         '''
         reply = self.send_broadcast(b'\x01\x00\x01')
         if reply is None:
@@ -351,11 +406,23 @@ class Visca():
         self.log.debug("all interfaces clear")
         return
 
-    def _cmd_cam(self, device:int, subcmd:bytes) -> Optional[bytes]:
+    def _cmd_cam(self, device:int, data:bytes) -> Optional[bytes]:
         '''
-        Send the command.  Returns reply
+        Send the command - starts with 8x 01 04
+        Will terminate with FF
+        Returns reply
         '''
-        reply = self.send_packet(device, b'\x01\x04' + subcmd)
+        reply = self.send_packet(device, b'\x01\x04' + data)
+        #FIXME: check returned data here and retransmit?
+        return reply
+
+    def _inq_cam(self, device:int, data:bytes) -> Optional[bytes]:
+        '''
+        Send the command - starts with 8x 09
+        Will terminate with FF
+        Returns reply
+        '''
+        reply = self.send_packet(device, b'\x09' + data)
         #FIXME: check returned data here and retransmit?
         return reply
 
@@ -363,6 +430,10 @@ class Visca():
     # POWER control.
     #
     def cmd_cam_power(self, device:int, onoff:bool) -> Optional[bytes]:
+        '''
+        Send 8x 01 04 00 0p FF
+        where p: 2=On, 3=Standby
+        '''
         if onoff:
             pwr = b'\x00\x02'
         else:
@@ -370,6 +441,9 @@ class Visca():
         return self._cmd_cam(device, pwr)
 
     def cmd_cam_power_on(self, device:int) -> Optional[bytes]:
+        '''
+        Power on the motors
+        '''
         return self.cmd_cam_power(device, True)
 
     def cmd_cam_power_off(self, device:int) -> Optional[bytes]:
@@ -640,6 +714,8 @@ class Visca():
         return self._cmd_pt(device, bytes([0x06, func]))
 
     def cmd_datascreen_on(self, device:int) -> Optional[bytes]:
+        '''
+        '''
         return self.cmd_datascreen(device, 0x02)
 
     def cmd_datascreen_off(self, device:int) -> Optional[bytes]:
@@ -694,7 +770,7 @@ class Visca():
         '''
         return self._cmd_ptd(device, 0, ts, 0x03, 0x01)
 
-    def cmd_ptd_down(self, device:int,ts:int = 0x14) -> Optional[bytes]:
+    def cmd_ptd_down(self, device:int, ts:int = 0x14) -> Optional[bytes]:
         '''
         PT_Down 8x 01 06 01 0p 0t 03 02 ff  p-pan speed, t-tilt speed
         Up -> increment tilt
@@ -823,3 +899,97 @@ class Visca():
     # Power_LED_Off 8x 01 33 02 00 ff
     # Green power LED. If switched to off and stored to startup profile,
     # it is always off.
+
+    def inq_version(self, device:int) -> Optional[bytes]:
+        '''
+        CAM_VersionInq
+        Returns information on the VISCA interface.
+        Inquiry Packet: CAM_VersionInq: 8X 09 00 02 FF
+        Reply Packet: Y0 50 GG GG HH HH JJ JJ KK FF
+        X = 1 to 7: Address of the unit (Locked to “X = 1” for VISCA over IP)
+        Y = 9 to F: Address of the unit +8 (Locked to “Y = 9” for VISCA over IP)
+        GGGG = Vender ID
+           0001: Sony
+        HHHH = Model ID
+           051C:BRC-X400
+           051D:BRC-X401
+           0617:SRG-X400
+           0618:SRG-X120
+           061A:SRG-201M2
+           061B:SRG-HD1M2
+        JJJJ = ROM revision
+        KK = Maximum socket # (02)
+        '''
+        res = self._inq_cam(device, b'\x00\x02')
+
+        return res
+
+    def inq_pt_position(self, device:int) -> Optional[Tuple[int, int]]:
+        '''
+        8X 09 06 12 FF
+        Y0 50 0p 0p 0p 0p 0t 0t 0t 0t FF
+        Returns (pan, tilt)
+        Supported by Monoprice-39512!
+        '''
+        # mitigate f/w bug
+        max_retries = 3
+        res = self._inq_cam(device, b'\x06\x12')
+        for _ in range(max_retries):
+            if res is None:
+                return None
+            if len(res) > 3:
+                break
+            # COMPLETION is NOT a valid response to Inquiry
+            # Monoprice-39512 f/w bug
+            res = self._inq_cam(device, b'\x06\x12')
+
+        assert res is not None
+        pan = self.v2i(res, 2)
+        tilt = self.v2i(res, 6)
+        self.log.debug(f'inq_pt_position({device:02x}) => {pan:04x}, {tilt:04x}')
+        return (pan, tilt)
+
+    def wait_for_pt_completion(self, device:int, secs:float) -> Tuple[
+            Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+        '''
+        Wait until the Pan/Tilt completes or timeout expires.
+        Waits at least 1s.
+        Returns a tuple ((pan0,tilt0), (pan1,tilt1))
+        '''
+        res = self.inq_pt_position(device)
+        if res is None:
+            return (None, None)
+        pan0, tilt0 = res
+        pan1, tilt1 = res
+        done = time() + secs
+        while time() < done:
+            sleep(1)
+            res = self.inq_pt_position(device)
+            if res is None:
+                fres1 = (pan0, tilt0), None
+                self.log.debug("wait_for_pt_completion(%d) => %s", device, fres1)
+                return fres1
+            pan, tilt = res
+            if pan != pan1 or tilt != tilt1:
+                pan1,tilt1 = pan,tilt
+            else:
+                fres2 = (pan0, tilt0), (pan1, tilt1)
+                self.log.debug("wait_for_pt_completion(%d) => %s", device, fres2)
+                return fres2
+
+        # timeout
+        raise ViscaTimeout(f"Reached wait_for_pt_completion timeout of {secs}")
+        #fres3 = (pan0, tilt0), (pan1, tilt1)
+        #self.log.debug(
+        #    "wait_for_pt_completion(%d) => %s, timeout", device, fres3)
+        #return fres3
+
+    def inq_pt_status(self, device:int) -> Optional[bytes]:
+        '''
+        8X 09 06 10 FF
+        Y0 50 pp pp FF
+        Ignored by Monoprice-39512
+        '''
+        self._inq_cam(device, b'\x06\x10')
+        # res is None because ACK is not returned
+        return self.wait_for_completion(5)

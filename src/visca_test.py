@@ -27,24 +27,30 @@ TODO: better error handling - exit(1) is not good enough
 '''
 
 import logging
+from multiprocessing import Process, current_process
 from time import sleep
 from typing import List, Tuple
 
-from . visca import Visca
-from . logger import create_logger
+from  visca import Visca, ViscaError
+from  logger import create_logger
 
 log = create_logger(
     None,  # log_file_path,
     logging.DEBUG)
 
 def visca_initialize(v: Visca) -> None:
+    print("v.cmd_address_set()")
     v.cmd_address_set()
-    sleep(3)
+    #sleep(3)
+    print("v.cmd_if_clear_all()")
     v.cmd_if_clear_all()
-    sleep(3)
+    #sleep(3)
     return
 
 def visca_memory_set(v: Visca, cam: int, postns: List[Tuple[int, int]]) -> None:
+    '''
+    Set memory 0..N according to element in pstns
+    '''
     mem = 0
     for pp, tp in postns:
         v.cmd_ptd_abs(cam, pp=pp, tp=tp)
@@ -56,30 +62,45 @@ def visca_memory_set(v: Visca, cam: int, postns: List[Tuple[int, int]]) -> None:
     return
 
 def main() -> None:
-    v = Visca(log, "/dev/ttyUSB1")
+    p = current_process()
+    p.name = 'visca_test'
+
+    v = Visca(log, "/dev/ttyUSB0", True)
     visca_initialize(v)
 
     # device # of the webcam
     CAM = 1
-#	v.cmd_cam_power_off(CAM)
+    print("v.cmd_cam_power_on(CAM)")
     v.cmd_cam_power_on(CAM)
-    v.cmd_cam_auto_power_off(CAM, 2)
-    v.cmd_datascreen_on(CAM)
+    v.wait_for_completion(30)
 
-    sleep(3)
+    #v.cmd_cam_auto_power_off(CAM, 2)
+    #v.cmd_datascreen_on(CAM)
+    #sleep(3)
 
-    visca_memory_set(v, CAM, [
-        (-1440, -360),
-        (1440, 360),
-        (0, 0),
-    ])
+    #print("v.inq_version(CAM)")
+    #v.inq_version(CAM) - on my camera leads to a bad syntax response
 
-    sleep(5)
-    v.cmd_cam_memory_recall(CAM,0)
-    sleep(3)
-    v.cmd_cam_memory_recall(CAM,1)
-    sleep(3)
-    v.cmd_cam_memory_recall(CAM,2)
+    print("v.cmd_ptd_reset(CAM)")
+    v.cmd_ptd_reset(CAM)
+
+    print("v.cmd_ptd_home(CAM)")
+    v.cmd_ptd_home(CAM)
+    v.wait_for_completion(30)
+    res = v.wait_for_pt_completion(CAM, 600)
+
+
+    #v.wait_for_completion(30)
+
+    #visca_memory_set(v, CAM, [
+    #    (-1440, -360),
+    #    (1440, 360),
+    #    (0, 0),
+    #])
+    #sleep(5)
+    #for mem in (0, 1, 2):
+    #    v.cmd_cam_memory_recall(CAM, mem)
+    #    sleep(3)
 
 
 #	sleep(1)
@@ -91,23 +112,23 @@ def main() -> None:
 #	v.cmd_cam_zoom_wide(CAM)
 #	sleep(7)
 
-#	v.cmd_cam_zoom_tele_speed(CAM,0)
+#	v.cmd_cam_zoom_tele_speed(CAM, 0)
 #	sleep(7)
-#	v.cmd_cam_zoom_wide_speed(CAM,0)
+#	v.cmd_cam_zoom_wide_speed(CAM, 0)
 #	sleep(7)
-#	v.cmd_cam_zoom_tele_speed(CAM,7)
+#	v.cmd_cam_zoom_tele_speed(CAM, 7)
 #	sleep(7)
-#	v.cmd_cam_zoom_wide_speed(CAM,7)
+#	v.cmd_cam_zoom_wide_speed(CAM, 7)
 #	sleep(7)
 
-# maximum digital zoom:
-#	v.cmd_cam_zoom_direct(CAM,0x7000)
+# max optical zoom
+#	v.cmd_cam_zoom_direct(CAM, 0x4000)
 #	sleep(7)
-#maximum optical zoom
-#	v.cmd_cam_zoom_direct(CAM,0x4000)
+# max digital zoom:
+#	v.cmd_cam_zoom_direct(CAM, 0x7000)
 #	sleep(7)
-#no zoom
-#	v.cmd_cam_zoom_direct(CAM,0x0)
+# no zoom
+#	v.cmd_cam_zoom_direct(CAM, 0x0)
 
 #	v.cmd_cam_dzoom_off(CAM)
 #	v.cmd_cam_zoom_direct(CAM,0x7000)
@@ -123,71 +144,105 @@ def main() -> None:
 #	sleep(2)
 #	v.cmd_cam_lr_reverse_off(CAM)
 
-#	v.cmd_cam_zoom_direct(CAM,0x7000)
+#	v.cmd_cam_zoom_direct(CAM, 0x7000)
 #	sleep(3)
 #	v.cmd_cam_freeze_on(CAM)
 #	sleep(2)
 
-#	v.cmd_cam_zoom_direct(CAM,0x0)
+#	v.cmd_cam_zoom_direct(CAM, 0x0)
 #	sleep(4)
 #	v.cmd_cam_freeze_off(CAM)
 
 #	v.cmd_cam_picture_effect_off(CAM)
 
-#	for i in range(0,9):
-#		v.cmd_cam_picture_effect(CAM,i)
-#		sleep(3)
+    #
+    # Try all the picture effects
+    #
+    #for i in range(0, 9):
+    #    v.cmd_cam_picture_effect(CAM,i)
+    #    sleep(3)
+    #
+    # Try all the digital effects for all the ranges
+    #
+    #for i in range(0,5):
+    #    v.cmd_cam_digital_effect(CAM,i)
+    #    for level in range(0,0x21):
+    #        v.cmd_cam_digital_effect_level(CAM,level)
+    #        sleep(2)
 
-#	for i in range(0,5):
-#		v.cmd_cam_digital_effect(CAM,i)
-#		for level in range(0,0x21):
-#			v.cmd_cam_digital_effect_level(CAM,level)
-#			sleep(2)
-
-#	v.cmd_ptd_up(CAM)
-#	sleep(3)
-#	v.cmd_ptd_down(CAM)
-#
-#	sleep(3)
-#
-#	v.cmd_ptd_up(CAM,2)
-#	sleep(3)
-#	v.cmd_ptd_down(CAM,2)
-#
-#
-#	v.cmd_ptd_left(CAM)
-#	sleep(3)
-#	v.cmd_ptd_right(CAM,2)
-#	sleep(3)
-#	v.cmd_ptd_right(CAM)
-#	sleep(1)
-#	v.cmd_ptd_left(CAM)
-#	sleep(1)
-#	v.cmd_ptd_right(CAM)
+    #for ts in (0x14, 2):
+    #    v.cmd_ptd_up(CAM, ts)
+    #    sleep(3)
+    #    v.cmd_ptd_down(CAM, ts)
+    #    sleep(3)
 
 
-#	v.cmd_ptd_upleft(CAM)
-#	sleep(2)
-#
-#	v.cmd_ptd_upright(CAM)
-#	sleep(2)
-#
-#	v.cmd_ptd_downleft(CAM)
-#	sleep(2)
-#
-#	v.cmd_ptd_downright(CAM)
-#	sleep(2)
-#
-#	v.cmd_ptd_home(CAM)
-#	sleep(2)
-#	v.cmd_ptd_reset(CAM)
+    #print('inq_pt_status')
+    #v.inq_pt_status(CAM)
 
-    v.cmd_cam_power_off(CAM)
+    print('inq_pt_position')
+    pos = v.inq_pt_position(CAM)
+    #
+    # swing from left to right
+    #
+    for ps in (0x2, 0x18):
+        print('go left from', pos)
+        v.cmd_ptd_left(CAM, ps)
+        v.wait_for_completion(3)
+        res = v.wait_for_pt_completion(CAM, 600)
+        print('go left => ', res)
+        if res is None:
+            break
+        _,pos = res
+        print('go right from', pos)
+        v.cmd_ptd_right(CAM, ps)
+        v.wait_for_completion(30)
+        res = v.wait_for_pt_completion(CAM, 600)
+        print('go right => ', res)
+        if res is None:
+            break
+        _,pos = res
+
+    #
+    # swing from up-left to down-right
+    #
+    #for ts, ps in ((0x14, 0x18), (2, 2)):
+    #    print(f"v.cmd_ptd_upleft(CAM, {ts}, {ps})")
+    #    v.cmd_ptd_upleft(CAM, ts, ps)
+    #    sleep(2)
+    #    print(f"v.cmd_ptd_downright(CAM, {ts}, {ps})")
+    #    v.cmd_ptd_downright(CAM,  ts, ps)
+    #    sleep(2)
+    #
+    # swing from up-right to down-left
+    #
+    #for ts, ps in ((0x14, 0x18), (2, 2)):
+    #    print(f"v.cmd_ptd_upright(CAM, {ts}, {ps})")
+    #    v.cmd_ptd_upright(CAM, ts, ps)
+    #    sleep(2)
+    #    print(f"v.cmd_ptd_downleft(CAM, {ts}, {ps})")
+    #    v.cmd_ptd_downleft(CAM, ts, ps)
+    #    sleep(2)
+
+    #print("v.cmd_ptd_home(CAM)")
+    #v.cmd_ptd_home(CAM)
+    #v.wait_for_completion(30)
+
+    print("v.cmd_ptd_reset(CAM)")
+    v.cmd_ptd_reset(CAM)
+    v.wait_for_completion(30)
+    v.wait_for_pt_completion(CAM, 600)
+
+    #v.cmd_cam_power_off(CAM)
     return
 
 
 if __name__ == '__main__':
     try:
         main()
+
+    except ViscaError as err:
+        print('caught ViscaError:', err)
+
     except KeyboardInterrupt:
-        pass
+        print('caught KeyboardInterrupt')
